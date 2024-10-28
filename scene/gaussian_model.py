@@ -57,16 +57,21 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 mlp_opacity : torch.nn.Sequential =None,
+                 mlp_cov: torch.nn.Sequential = None,
+                 mlp_color: torch.nn.Sequential = None,
+
                  ):
 
         self.feat_dim = feat_dim
         self.n_offsets = n_offsets
         self.voxel_size = voxel_size
+        print('Initial Voxel size', voxel_size)
         self.update_depth = update_depth
         self.update_init_factor = update_init_factor
         self.update_hierachy_factor = update_hierachy_factor
         self.use_feat_bank = use_feat_bank
-
+        print('updatedepth', update_depth)
         self.appearance_dim = appearance_dim
         self.embedding_appearance = None
         self.ratio = ratio
@@ -103,29 +108,38 @@ class GaussianModel:
                 nn.Softmax(dim=1)
             ).cuda()
 
-        self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
-        self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, n_offsets),
-            nn.Tanh()
-        ).cuda()
+        if mlp_opacity is None:
+            self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
+            self.mlp_opacity = nn.Sequential(
+                nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, n_offsets),
+                nn.Tanh()
+            ).cuda()
+        else:
+            self.mlp_opacity = mlp_opacity.cuda()
 
-        self.add_cov_dist = add_cov_dist
-        self.cov_dist_dim = 1 if self.add_cov_dist else 0
-        self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, 7*self.n_offsets),
-        ).cuda()
+        if mlp_cov is None:
+            self.add_cov_dist = add_cov_dist
+            self.cov_dist_dim = 1 if self.add_cov_dist else 0
+            self.mlp_cov = nn.Sequential(
+                nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 7*self.n_offsets),
+            ).cuda()
+        else:
+            self.mlp_cov = mlp_cov.cuda()
 
-        self.color_dist_dim = 1 if self.add_color_dist else 0
-        self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, 3*self.n_offsets),
-            nn.Sigmoid()
-        ).cuda()
+        if mlp_color is None:
+            self.color_dist_dim = 1 if self.add_color_dist else 0
+            self.mlp_color = nn.Sequential(
+                nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*self.n_offsets),
+                nn.Sigmoid()
+            ).cuda()
+        else:
+            self.mlp_color = mlp_color.cuda()
 
 
     def eval(self):
@@ -141,6 +155,7 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
+        print('isititrain', self.mlp_color.training)
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
@@ -272,7 +287,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
 
-    def training_setup(self, training_args):
+    def training_setup(self, training_args, mlp_only=False, feat_only=False):
         self.percent_dense = training_args.percent_dense
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -281,9 +296,27 @@ class GaussianModel:
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
-        
-        
-        if self.use_feat_bank:
+        if mlp_only:
+            print('mlp only')
+            l = [
+                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init,
+                 "name": "mlp_opacity"},
+                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
+                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+            ]
+        if feat_only:
+            print('feature only')
+            l = [
+                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale,
+                 "name": "anchor"},
+                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale,
+                 "name": "offset"},
+                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},]
+
+        elif self.use_feat_bank:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
@@ -313,6 +346,7 @@ class GaussianModel:
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
         else:
+            print('HERE\n')
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
@@ -420,6 +454,7 @@ class GaussianModel:
         PlyData([el]).write(path)
 
     def load_ply_sparse_gaussian(self, path):
+        print(f'Loading ply sparse gaussian from {path}')
         plydata = PlyData.read(path)
 
         anchor = np.stack((np.asarray(plydata.elements[0]["x"]),
@@ -583,6 +618,7 @@ class GaussianModel:
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
+            print(f'Anchor growing {i}')
             # update threshold
             cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
             # mask from grad threshold
@@ -791,6 +827,8 @@ class GaussianModel:
 
 
     def load_mlp_checkpoints(self, path, mode = 'split'):#split or unite
+        print(f'Loading mlp from {path}')
+
         if mode == 'split':
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()

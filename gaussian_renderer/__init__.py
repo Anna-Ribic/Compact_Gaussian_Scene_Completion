@@ -13,17 +13,21 @@ from einops import repeat
 
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
+#from scene.gaussian_model import GaussianModel
 
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
+def generate_neural_gaussians(viewpoint_camera, pc , visible_mask=None, is_training=False):
     ## view frustum filtering for acceleration    
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
     
     feat = pc._anchor_feat[visible_mask]
+    #print('Feat', feat.shape)
     anchor = pc.get_anchor[visible_mask]
+    #print('anchor', anchor.shape)
     grid_offsets = pc._offset[visible_mask]
+    #print('offset', grid_offsets.shape)
     grid_scaling = pc.get_scaling[visible_mask]
+    #print('scale', grid_scaling.shape)
 
     ## get view properties for anchor
     ob_view = anchor - viewpoint_camera.camera_center
@@ -110,14 +114,15 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+def render(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, is_training=None,visible_mask=None, retain_grad=False):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
-    is_training = pc.get_color_mlp.training
-        
+    if not is_training:
+        is_training = pc.get_color_mlp.training
+
     if is_training:
         xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
@@ -183,7 +188,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 }
 
 
-def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def prefilter_voxel(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 
     
@@ -230,6 +235,8 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
+
+    #print(f"means3D shape: {means3D.shape}, scales shape: {scales.shape if scales is not None else 'None'}")
 
     radii_pure = rasterizer.visible_filter(means3D = means3D,
         scales = scales[:,:3],

@@ -50,7 +50,7 @@ class ModelParams(ParamGroup):
         self.feat_dim = 32
         self.n_offsets = 10
         self.voxel_size =  0.001 # if voxel_size<=0, using 1nn dist
-        self.update_depth = 3
+        self.update_depth = 0 #3
         self.update_init_factor = 16
         self.update_hierachy_factor = 4
 

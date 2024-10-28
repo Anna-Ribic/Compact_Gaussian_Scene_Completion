@@ -168,7 +168,7 @@ def read_intrinsics_text(path):
                 elems = line.split()
                 camera_id = int(elems[0])
                 model = elems[1]
-                assert model == "PINHOLE", "While the loader support other types, the rest of the code assumes PINHOLE"
+                #assert model == "PINHOLE", "While the loader support other types, the rest of the code assumes PINHOLE"
                 width = int(elems[2])
                 height = int(elems[3])
                 params = np.array(tuple(map(float, elems[4:])))
@@ -246,13 +246,16 @@ def read_extrinsics_text(path):
     Taken from https://github.com/colmap/colmap/blob/dev/scripts/python/read_write_model.py
     """
     images = {}
+    print(path)
     with open(path, "r") as fid:
         while True:
             line = fid.readline()
             if not line:
                 break
             line = line.strip()
+            #print(line)
             if len(line) > 0 and line[0] != "#":
+                #print('this is made into an image',line)
                 elems = line.split()
                 image_id = int(elems[0])
                 qvec = np.array(tuple(map(float, elems[1:5])))
@@ -267,6 +270,7 @@ def read_extrinsics_text(path):
                     id=image_id, qvec=qvec, tvec=tvec,
                     camera_id=camera_id, name=image_name,
                     xys=xys, point3D_ids=point3D_ids)
+
     return images
 
 

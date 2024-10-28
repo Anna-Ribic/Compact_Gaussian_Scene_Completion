@@ -28,7 +28,9 @@ try:
 except:
     print("No laspy")
 from utils.sh_utils import SH2RGB
-from scene.gaussian_model import BasicPointCloud
+#from scene.gaussian_model import BasicPointCloud
+from utils.graphics_utils import BasicPointCloud
+
 import cv2
 
 
@@ -92,6 +94,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         T = np.array(extr.tvec)
 
         # if intr.model=="SIMPLE_PINHOLE":
+        #print(intr.model)
         if intr.model=="SIMPLE_PINHOLE" or intr.model == "SIMPLE_RADIAL":
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
@@ -104,7 +107,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
         
-        # print(f'FovX: {FovX}, FovY: {FovY}')
+        #print(f'FovX: {FovX}, FovY: {FovY}')
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
@@ -146,7 +149,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+def readColmapSceneInfo(path, images, eval, lod, llffhold=16):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -174,6 +177,7 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
                 test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx > lod]
 
         else:
+            print(f'using llffhold:', llffhold)
             train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
             test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     
