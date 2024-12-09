@@ -9,7 +9,7 @@
     "dataset_config": {
         "rec_name": "lr_5e-4-100-discrete-0.05-withoffsetfeat",
         "cache_dir": "nocuda",
-        "source_path": "single_gaussians-new",
+        "source_path": "../Scaffold-GS/single_gaussians-new",
         "data_path": "../BP/scenes",
         "voxel_size": 0.05,
         "normalize": false,

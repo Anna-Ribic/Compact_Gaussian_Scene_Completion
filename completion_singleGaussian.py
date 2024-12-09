@@ -299,12 +299,6 @@ class PointCloudDatasetBatched(Dataset):
         # Parse the command-line arguments
         self.cam_args = parser.parse_args([])
 
-        mean_std_data = torch.load('mean_std.pt')
-        self.global_mean = mean_std_data['mean'].cpu().detach().numpy()
-        self.global_std = mean_std_data['std'].cpu().detach().numpy()
-        print(f"Loaded mean (tensor): {self.global_mean}")
-        print(f"Loaded std (tensor): {self.global_std}")
-
     def __len__(self):
         return len(self.file_pairs)
 

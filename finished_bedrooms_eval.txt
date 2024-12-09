@@ -1,0 +1,10 @@
+07f0017d-f172-4450-a840-7c9cba27b9b2/Bedroom
+07f02d16-a025-4bc4-a45d-5f487c545f49/MasterBedroom
+07f56e76-ac57-4f60-9390-8063fdc55e67/Bedroom
+07f9d32c-5f7c-4f97-b98b-6ec2722efb07/Bedroom
+081b8907-7e4d-4764-b931-7709386de7da/MasterBedroom
+081b8907-7e4d-4764-b931-7709386de7da/SecondBedroom
+08784340-d255-4dca-b916-398e84f65124/MasterBedroom
+089458cc-75b2-45c8-a58d-177cb6aced8c/MasterBedroom
+08ee3c6d-a06d-451a-9241-09b050788d07/SecondBedroom
+08ee3c6d-a06d-451a-9241-09b050788d07/MasterBedroom
