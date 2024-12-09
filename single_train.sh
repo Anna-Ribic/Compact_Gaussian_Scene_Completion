@@ -1,6 +1,6 @@
-scene='mipnerf360/bicycle'
+scene='79/LivingDiningRoom'
 exp_name='baseline'
-voxel_size=0.001
+voxel_size=0.05
 update_init_factor=16
 appearance_dim=0
 ratio=1

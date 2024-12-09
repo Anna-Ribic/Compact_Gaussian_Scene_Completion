@@ -1,0 +1,47 @@
+{
+    "file_names": {
+        "train": "finished_bedrooms_train.txt",
+        "val": "finished_bedrooms_eval.txt"
+    },
+    "logging": {
+        "writer_name": "completion"
+    },
+    "dataset_config": {
+        "rec_name": "lr_5e-4-100-discrete-0.05-withoffsetfeat",
+        "cache_dir": "nocuda",
+        "source_path": "single_gaussians-new",
+        "data_path": "../BP/scenes",
+        "voxel_size": 0.05,
+        "normalize": false,
+        "augmentation": false,
+        "flip": true,
+        "rotate": true,
+        "threshold": 98,
+        "batch_size": 4,
+        "load_scene_info": false,
+        "center": false,
+        "use_cache": true
+    },
+    "training": {
+        "learning_rate": 0.00001,
+        "num_epochs": 1000,
+        "model_path": "",
+        "save_path": "example_save_path.pth",
+        "exp_name": "example_experiment_name",
+        "visualize": false,
+        "loss": {
+            "losses": ["anchor", "3dfeat", "render"],
+            "mini_batch_size": 8
+        }
+    },
+    "evaluation": {
+        "model_path": "example_save_path.pth",
+        "exp_name": "example_experiment_name",
+        "eval_iou": true,
+        "eval_img": true,
+        "render_video": false,
+        "visualize": false,
+        "split": "test"
+    }
+}
+
