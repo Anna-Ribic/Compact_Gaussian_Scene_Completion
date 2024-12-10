@@ -23,7 +23,7 @@ def generate_neural_gaussians_no_scaffold(viewpoint_camera, pc, visible_mask=Non
     scaling = pc.get_scaling[visible_mask]
 
     # opacity mask generation
-    neural_opacity = pc.get_opacity
+    neural_opacity = pc.get_opacity[visible_mask]
     neural_opacity = neural_opacity.reshape([-1, 1])
     mask = (neural_opacity > 0.0)
     mask = mask.view(-1)

@@ -1,0 +1,18 @@
+{
+    "train_files": "finished_bedrooms_eval.txt",
+    "exp_name": "test",
+    "writer_name": "writer",
+    "save_path": "new-sg",
+    "dataset_config": {
+        "data_path": "../BP/scenes/",
+        "voxel_size": 0.05,
+        "normalize": false,
+        "augmentation": false,
+        "flip": true,
+        "rotate": true,
+        "threshold": 90,
+        "batch_size": 1,
+        "load_scene_info": true,
+        "center": false
+    }
+}

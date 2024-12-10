@@ -17,7 +17,7 @@
         "flip": true,
         "rotate": true,
         "threshold": 98,
-        "batch_size": 4,
+        "batch_size": 1,
         "load_scene_info": false,
         "center": false,
         "use_cache": true

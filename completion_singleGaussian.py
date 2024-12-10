@@ -1078,9 +1078,6 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         o3d.visualization.draw_geometries(ll)
                         ll.clear()
 
-                print('before feat')
-                print(
-                    f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
 
                 if loss_feat_flag:
 
@@ -1120,9 +1117,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                     del mapped_features, ground_truth_features
                     torch.cuda.empty_cache()
                     gc.collect()
-                    print('after feat')
-                    print(
-                        f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
+
 
                 if (loss_feat_flag and epoch % logging_frequency and iteration==epoch*n_it) or loss_render_flag:
 
@@ -1211,11 +1206,6 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                     del features, keep, gaussians, anchors
                     torch.cuda.empty_cache()
 
-
-                print('before loss backward')
-                print(
-                    f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
-
                 # Backward pass and optimize
                 loss.backward()
 
@@ -1223,19 +1213,12 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                 net_optimizer.zero_grad(set_to_none=True)
                 gc.collect()  # Forces Python's garbage collector to free memory
 
-                print('after loss backward')
-                print(
-                    f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
 
                 for p in net.parameters():
                     if hasattr(p, 'grad') and p.grad is not None:
                         print(delete)
                         p.grad = None
                         del p.grad
-
-                print('after delete')
-                print(
-                    f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
 
                 del loss, incomplete_tensor, ground_truth_tensor, out_cls, targets, cm, target_key
                 torch.cuda.empty_cache()
