@@ -393,10 +393,10 @@ class CompletionNetSmaller(nn.Module):
 
     #ENC_CHANNELS = [256, 768, 1536, 2048]
     #DEC_CHANNELS = [256, 768, 1536, 2048]
-    feat_size = 15
 
-    def __init__(self, in_nchannel=512):
+    def __init__(self, feat_size=15):
         nn.Module.__init__(self)
+        self.feat_size = feat_size
 
         # Input sparse tensor must have tensor stride 128.
         enc_ch = self.ENC_CHANNELS

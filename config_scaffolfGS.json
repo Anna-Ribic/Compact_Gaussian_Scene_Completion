@@ -1,0 +1,47 @@
+{
+    "file_names": {
+        "train": "finished_bedrooms_train.txt",
+        "val": "finished_bedrooms_eval.txt"
+    },
+    "logging": {
+        "writer_name": "completion"
+    },
+    "dataset_config": {
+        "mlps_name": "full_100-ou_60_in_500-v2-featonly",
+        "cache_dir": "nocuda",
+        "source_path": "../Scaffold-GS/mlp_vs_sg",
+        "data_path": "../BP/scenes",
+        "voxel_size": 0.05,
+        "normalize": false,
+        "augmentation": false,
+        "flip": true,
+        "rotate": true,
+        "threshold": 98,
+        "batch_size": 4,
+        "load_scene_info": false,
+        "center": false,
+        "use_cache": true
+    },
+    "training": {
+        "learning_rate": 0.00001,
+        "num_epochs": 1000,
+        "model_path": "",
+        "save_path": "example_save_path.pth",
+        "exp_name": "example_experiment_name",
+        "visualize": false,
+        "loss": {
+            "losses": ["anchor", "3dfeat", "render"],
+            "mini_batch_size": 8
+        }
+    },
+    "evaluation": {
+        "model_path": "example_save_path.pth",
+        "exp_name": "example_experiment_name",
+        "eval_iou": true,
+        "eval_img": true,
+        "render_video": false,
+        "visualize": false,
+        "split": "test"
+    }
+}
+

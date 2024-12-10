@@ -15,6 +15,33 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 #from scene.gaussian_model import GaussianModel
 
+def generate_neural_gaussians_no_scaffold(viewpoint_camera, pc, visible_mask=None, is_training=False):
+
+    if visible_mask is None:
+        visible_mask = torch.ones(pc.get_xyz.shape[0], dtype=torch.bool, device=pc.get_xyz.device)
+
+    scaling = pc.get_scaling[visible_mask]
+
+    # opacity mask generation
+    neural_opacity = pc.get_opacity
+    neural_opacity = neural_opacity.reshape([-1, 1])
+    mask = (neural_opacity > 0.0)
+    mask = mask.view(-1)
+
+    # select opacity
+    opacity = neural_opacity[mask]
+
+    # get offset's color
+    color = pc.get_color[visible_mask]
+    rot = pc.get_rotation[visible_mask]
+    xyz = pc.get_xyz[visible_mask]
+
+    if is_training:
+        return xyz, color, opacity, scaling, rot, mask
+    else:
+        return xyz, color, opacity, scaling, rot
+
+
 def generate_neural_gaussians(viewpoint_camera, pc , visible_mask=None, is_training=False):
     ## view frustum filtering for acceleration    
     if visible_mask is None:
@@ -114,23 +141,28 @@ def generate_neural_gaussians(viewpoint_camera, pc , visible_mask=None, is_train
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, is_training=None,visible_mask=None, retain_grad=False):
+def render(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, is_training=None,visible_mask=None, retain_grad=False, no_scaffold=False):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
-    if not is_training:
-        is_training = pc.get_color_mlp.training
 
-    if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    if no_scaffold:
+        xyz, color, opacity, scaling, rot, mask = generate_neural_gaussians_no_scaffold(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        is_training = True
     else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    
+        if not is_training:
+            is_training = pc.get_color_mlp.training
+
+        if is_training:
+            xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        else:
+            xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     if retain_grad:
         try:
             screenspace_points.retain_grad()
@@ -177,7 +209,7 @@ def render(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifie
                 "visibility_filter" : radii > 0,
                 "radii": radii,
                 "selection_mask": mask,
-                "neural_opacity": neural_opacity,
+                "neural_opacity": opacity,
                 "scaling": scaling,
                 }
     else:
@@ -188,14 +220,18 @@ def render(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifie
                 }
 
 
-def prefilter_voxel(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def prefilter_voxel(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, no_scaffold=False):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_anchor, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    if no_scaffold:
+        screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True,
+                                              device="cuda") + 0
+    else:
+        screenspace_points = torch.zeros_like(pc.get_anchor, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
@@ -222,7 +258,7 @@ def prefilter_voxel(viewpoint_camera, pc , pipe, bg_color : torch.Tensor, scalin
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_anchor
+    means3D = pc.get_xyz
 
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from

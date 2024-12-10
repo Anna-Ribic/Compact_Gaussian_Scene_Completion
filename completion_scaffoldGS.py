@@ -26,8 +26,8 @@ import sys
 import subprocess
 import argparse
 import logging
+from ctypes.wintypes import tagPOINT
 from html.parser import incomplete
-from http.cookiejar import request_port
 from pyexpat import features
 
 import numpy as np
@@ -51,8 +51,8 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from utils.image_utils import psnr
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
-
-import torch.multiprocessing as mp
+from torch.optim.lr_scheduler import StepLR
+import json
 
 
 ch = logging.StreamHandler(sys.stdout)
@@ -79,11 +79,8 @@ parser.add_argument("--eval", action="store_true")
 parser.add_argument("--max_visualization", type=int, default=4)
 
 
-###############################################################################
-# End of utility functions
-###############################################################################
-
 from completion_models import CompletionNetSmaller
+
 ####################################################
 
 # Dataset
@@ -91,12 +88,12 @@ from completion_models import CompletionNetSmaller
 ####################################################
 import numpy as np
 import torch
-
 from plyfile import PlyData
 import MinkowskiEngine as ME
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 import random
+
 
 
 def center_around_z(coords, given_centroid=None):
@@ -255,30 +252,24 @@ from gaussian_renderer import prefilter_voxel, render, network_gui
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 
-def get_cuda_tensors():
-    return {id(obj): obj for obj in gc.get_objects() if isinstance(obj, torch.Tensor) and obj.is_cuda}
 
-
+import copy
 class PointCloudDatasetBatched(Dataset):
-    def __init__(self, files, config):
+    def __init__(self, files,config, cache_dir='cache', use_cache=False):
         self.dirs = files  # List of (incomplete_path, ground_truth_path) tuples
         self.data_path = config['data_path']
-        self.file_pairs = [(f'{config["source_path"]}/{p}_pent/{config["rec_name"]}/gaussians.pth',
-                            f'{config["source_path"]}/{p}/{config["rec_name"]}/gaussians.pth') for p in files]
-        self.voxel_size = config['voxel_size']  # Size of each voxel in the grid
+        self.file_pairs =  [(f'{config["source_path"]}/{p}_pent/point_cloud/full_100-ou_60_in_500-v2/point_cloud.ply', f'{config["source_path"]}/{p}/point_cloud/{config["mlps_name"]}/point_cloud.ply') for p in files]
+        self.voxel_size =  config['voxel_size'] # Size of each voxel in the grid
         self.init_threshold = config['threshold']
         self.normalize = config['normalize']
-        self.cache_dir = os.path.join(config['cache_dir'], config['rec_name'])
         self.z_threshold = None
         self.mean = None
         self.std = None
         self.border = None
+        print(cache_dir, config['mlps_name'])
+        self.cache_dir = os.path.join(cache_dir, config['mlps_name'])
+        self.use_cache = use_cache
 
-        self.use_cache = config['use_cache']
-
-        # Ensure cache directory exists
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir)
 
         self.rotator = RotationZ90()
         self.flipper = RandomMirror()
@@ -293,88 +284,163 @@ class PointCloudDatasetBatched(Dataset):
         parser = argparse.ArgumentParser(description="Process resolution input")
 
         # Add the '--resolution' argument
-        parser.add_argument('--resolution', default=-1, type=int, help='Set the resolution (e.g., 1080)')
-        parser.add_argument('--data_device', default='cuda', type=str, help='Device')
+        parser.add_argument('--resolution', default=-1,type=int, help='Set the resolution (e.g., 1080)')
+        parser.add_argument('--data_device', default='cuda',type=str, help='Device')
+
 
         # Parse the command-line arguments
         self.cam_args = parser.parse_args([])
 
+        self.mlps_name = config['mlps_name']
+
+
     def __len__(self):
         return len(self.file_pairs)
 
-    def _get_cache_path(self, idx):
-        return os.path.join(self.cache_dir, f'sample_{idx}.pkl')
+    def compute_global_mean_std(self):
+        all_features = []
 
-    def read_ply_file(self, file_path, normalize):
-        # Load the saved point cloud data
-        data = torch.load(file_path)
+        for _, ground_truth_path in self.file_pairs:
+            print(ground_truth_path)
+            ply_data = PlyData.read(ground_truth_path)
+            vertex = ply_data['vertex'].data
 
-        # Extract attributes from the loaded data
-        xyz = data["xyz"].numpy()
-        offset = data["offset"]
-        color = data["color"].numpy()  # Color is always present
-        opacity = data["opacity"].numpy()
-        scaling = data["scaling"].numpy()
-        rotation = data["rotation"].numpy()
+            dtype = [('x', np.float32), ('y', np.float32), ('z', np.float32),
+                     ('nx', np.float32), ('ny', np.float32), ('nz', np.float32),
+                     *[(f'f_offset_{i}', np.float32) for i in range(30)],
+                     *[(f'f_anchor_feat_{i}', np.float32) for i in range(32)],
+                     ('opacity', np.float32),
+                     *[(f'scale_{i}', np.float32) for i in range(6)],
+                     *[(f'rot_{i}', np.float32) for i in range(4)]]
+
+            data = np.array([tuple(vertex[i]) for i in range(len(vertex))], dtype=dtype)
+
+            coords = np.vstack((data['x'], data['y'], data['z'])).T
+
+            # Define threshold to remove ceiling, use gt threshold if defined
+            if self.z_threshold is None:
+                self.z_threshold = np.percentile(coords[:, 2], self.init_threshold)
+            # print(f"Z threshold (th percentile): {self.z_threshold}")
+
+            # Filter out the points above the threshold
+            mask = coords[:, 2] <= self.z_threshold
+            data = data[mask]
+            coords = coords[mask]
+
+            # Do not incude normals and rotation in features since they are the same for all points (ScaffoldGs specific)
+            features = np.vstack((
+                # data['nx'], data['ny'], data['nz'],
+
+                *[data[f'f_offset_{i}'] for i in range(30)],
+                *[data[f'f_anchor_feat_{i}'] for i in range(32)],
+                data['opacity'],
+                *[data[f'scale_{i}'] for i in range(6)],
+                # *[data[f'rot_{i}'] for i in range(4)],
+            )).T
+
+            all_features.append(features)
+
+        # Concatenate all features from all ground truth files
+        all_features = np.vstack(all_features)
+
+        # Compute the global mean and std for all features
+        global_mean = all_features.mean(axis=0)
+        global_std = all_features.std(axis=0)
+
+        print(f"Global mean: {global_mean}")
+        print(f"Global std: {global_std}")
+
+        global_mean = torch.from_numpy(all_features.mean(axis=0)).float()
+        global_std = torch.from_numpy(all_features.std(axis=0)).float()
+
+        # Save mean and std tensors to file
+        torch.save({'mean': global_mean, 'std': global_std}, 'mean_std.pt')
+
+    def read_ply_file(self, ply_file, normalize):
+        #print('Normalieze', normalize)
+
+        ply_data = PlyData.read(ply_file)
+        vertex = ply_data['vertex'].data
+
+        dtype = [('x', np.float32), ('y', np.float32), ('z', np.float32),
+                 ('nx', np.float32), ('ny', np.float32), ('nz', np.float32),
+                 *[(f'f_offset_{i}', np.float32) for i in range(30)],
+                 *[(f'f_anchor_feat_{i}', np.float32) for i in range(32)],
+                 ('opacity', np.float32),
+                 *[(f'scale_{i}', np.float32) for i in range(6)],
+                 *[(f'rot_{i}', np.float32) for i in range(4)]]
+
+        data = np.array([tuple(vertex[i]) for i in range(len(vertex))], dtype=dtype)
+
+        #print('Offset0\n:', data['f_offset_0'].min(), data['f_offset_0'].max())
+        """for i in range(30):
+            if data[f'f_offset_{i}'].min()!= 0:
+                print(f'Offset_{i}\n:', data[f'f_offset_{i}'].min(), data[f'f_offset_{i}'].max())"""
+
+
+        coords = np.vstack((data['x'], data['y'], data['z'])).T
 
         # Define threshold to remove ceiling, use gt threshold if defined
         if self.z_threshold is None:
-            self.z_threshold = np.percentile(xyz[:, 2], self.init_threshold)
+            self.z_threshold = np.percentile(coords[:, 2], self.init_threshold)
+        #print(f"Z threshold (th percentile): {self.z_threshold}")
+
         # Filter out the points above the threshold
-        mask = xyz[:, 2] <= self.z_threshold
-        xyz = xyz[mask]
-        color = color[mask]
-        opacity = opacity[mask]
-        scaling = scaling[mask]
-        rotation = rotation[mask]
-        offset = offset[mask]
+        mask = coords[:, 2] <= self.z_threshold
+        data = data[mask]
+        coords = coords[mask]
 
-        # Discretize point coordinates
-        discrete_coords = np.floor(xyz / self.voxel_size).astype(np.int32)
+        #Discretize point coordintaes
+        discrete_coords = np.floor(coords / self.voxel_size).astype(np.int32)
 
-        # Build features: exclude rotation for consistency with ScaffoldGS
-        features = np.hstack([
-            color,  # Include color
-            opacity,
-            scaling,
-            rotation,
-            offset
-        ])
+        #Do not incude normals and rotation in features since they are the same for all points (ScaffoldGs specific)
+        features = np.vstack((
+            #data['nx'], data['ny'], data['nz'],
 
-        # Normalize features
+            *[data[f'f_offset_{i}'] for i in range(30)],
+            *[data[f'f_anchor_feat_{i}'] for i in range(32)],
+            data['opacity'],
+            *[data[f'scale_{i}'] for i in range(6)],
+            #*[data[f'rot_{i}'] for i in range(4)],
+        )).T
+
+        #Normalize features
         if normalize:
             features = (features - self.global_mean) / (self.global_std + 1e-8)
-            print(f'Normalize Features mean: {features.mean(axis=0)} '
-                  f'features std: {features.std(axis=0)} '
-                  f'features_min: {features.min(axis=0)} '
-                  f'features_max: {features.max(axis=0)}')
+            print(f'Normalize Features mean: {features.mean(axis=0)} featues std: {features.std(axis=0)} features_min: {features.min(axis=0)} features_max: {features.max(axis=0)}')
 
-        # Define all points as present initially
+        #Define all points as present initially
         ones_column = np.ones((features.shape[0], 1))
         features_with_ones = np.hstack((ones_column, features))
 
-        # Convert to tensors
+
+        #features_tensor = torch.from_numpy(features_with_ones).float()
+        #coordinates_tensor = torch.from_numpy(discrete_coords)
+
         features_tensor = features_with_ones
         coordinates_tensor = discrete_coords
 
         return features_tensor, coordinates_tensor
 
+    def _get_cache_path(self, idx):
+        return os.path.join(self.cache_dir, f'sample_{idx}.pkl')
+
     def __getitem__(self, idx):
+        room_dir = self.dirs[idx]
+        data_dir = f'{self.data_path}/{room_dir}'
+        res={}
+
+
         cache_path = self._get_cache_path(idx)
-
-        print(idx, cache_path)
-
         if self.use_cache and os.path.exists(cache_path):
             print(f'Loading from cache: {cache_path}')
             with open(cache_path, 'rb') as f:
                 res = pickle.load(f)
             incomplete_features, incomplete_coords = res['incomplete']
             ground_truth_features, ground_truth_coords = res['ground_truth']
+
         else:
-            print(f'Cache not found for index {idx}, processing data.')
-            room_dir = self.dirs[idx]
-            data_dir = f'{self.data_path}/{room_dir}'
-            res = {}
+            print('incomplete path NOT found in cache\n:', cache_path)
             incomplete_path, ground_truth_path = self.file_pairs[idx]
 
             ground_truth_features, ground_truth_coords = self.read_ply_file(ground_truth_path, normalize=self.normalize)
@@ -406,30 +472,87 @@ class PointCloudDatasetBatched(Dataset):
 
         if self.augmentation:
             if self.rotate:
+                # print('Random rotate')
                 ground_truth_coords, ground_truth_features = self.rotator(ground_truth_coords, ground_truth_features)
                 incomplete_coords, incomplete_features = self.rotator(incomplete_coords, incomplete_features)
                 self.rotator.resample()
             if self.flip and random.random() < 0.2:
+                # print('Random flip')
                 ground_truth_coords, ground_truth_features = self.flipper(ground_truth_coords, ground_truth_features)
                 incomplete_coords, incomplete_features = self.flipper(incomplete_coords, incomplete_features)
                 self.flipper.resample()
-
-        res.update({
-            'incomplete': (incomplete_features, incomplete_coords),
-            'ground_truth': (ground_truth_features, ground_truth_coords),
-        })
-
-
-        print(res['incomplete_path'])
 
         self.z_threshold = None
         self.mean = None
         self.std = None
         self.border = None
 
+        res.update({
+            'incomplete': (incomplete_features, incomplete_coords),
+            'ground_truth': (ground_truth_features, ground_truth_coords)
+        })
+
         return res
 
 
+def custom_collate_fn_batched_temp(batch):
+    incomplete_features, incomplete_coords = batch[0]['incomplete']
+    ground_truth_features, ground_truth_coords = batch[0]['ground_truth']
+
+    # Create sparse tensors for incomplete and ground truth data
+    incomplete_sparse_tensor = ME.SparseTensor(
+        features=incomplete_features,
+        coordinates=ME.utils.batched_coordinates([incomplete_coords]),
+        quantization_mode=ME.SparseTensorQuantizationMode.RANDOM_SUBSAMPLE,
+        device='cuda'
+    )
+
+    ground_truth_sparse_tensor = ME.SparseTensor(
+        features=ground_truth_features,
+        coordinates=ME.utils.batched_coordinates([ground_truth_coords]),
+        quantization_mode=ME.SparseTensorQuantizationMode.RANDOM_SUBSAMPLE,
+        device='cuda'
+    )
+
+    batch[0]['incomplete'] = incomplete_sparse_tensor
+    batch[0]['ground_truth'] = ground_truth_sparse_tensor
+
+    return batch[0]
+
+
+def custom_collate_fn_batched_multiple(batch):
+    # Separate all incomplete and ground truth features and coordinates from the batch
+    incomplete_features_list = [item['incomplete'][0] for item in batch]
+    incomplete_coords_list = [item['incomplete'][1] for item in batch]
+
+    ground_truth_features_list = [item['ground_truth'][0] for item in batch]
+    ground_truth_coords_list = [item['ground_truth'][1] for item in batch]
+
+    # Create sparse tensors for incomplete and ground truth data
+    incomplete_sparse_tensor = ME.SparseTensor(
+        features=torch.cat(incomplete_features_list, dim=0),
+        coordinates=ME.utils.batched_coordinates(incomplete_coords_list),
+        quantization_mode=ME.SparseTensorQuantizationMode.RANDOM_SUBSAMPLE,
+        device='cuda'
+    )
+
+    ground_truth_sparse_tensor = ME.SparseTensor(
+        features=torch.cat(ground_truth_features_list, dim=0),
+        coordinates=ME.utils.batched_coordinates(ground_truth_coords_list),
+        quantization_mode=ME.SparseTensorQuantizationMode.RANDOM_SUBSAMPLE,
+        device='cuda'
+    )
+
+    # Replace the original batch data with the sparse tensors
+    for i in range(len(batch)):
+        batch[i]['incomplete'] = incomplete_sparse_tensor
+        batch[i]['ground_truth'] = ground_truth_sparse_tensor
+
+    return batch[0]
+
+
+def custom_collate_fn(batch):
+    return batch
 
 
 def custom_collate_fn_batched(batch):
@@ -479,7 +602,6 @@ def custom_collate_fn_batched(batch):
 
     return incomplete_sparse_tensor, ground_truth_sparse_tensor, batch
 
-
 def custom_collate_fn_batched_multi(batch):
     batch_incomplete_coords = []
     batch_incomplete_features = []
@@ -512,6 +634,7 @@ def custom_collate_fn_batched_multi(batch):
 
 
     return batch_incomplete_features, batch_incomplete_coords, batch_ground_truth_features, batch_ground_truth_coords, batch  #incomplete_sparse_tensor, ground_truth_sparse_tensor, batch
+
 
 
 def get_bounding_box_and_voxel_count(discrete_coords):
@@ -654,8 +777,11 @@ def log_heatmap(diff, step, writer, feature_names):
 
 
 def log_feature_distribution(pred, gt, step, writer, feature_names):
+    print('logging feat dist')
     pred_np = pred.detach().cpu().numpy()
     gt_np = gt.detach().cpu().numpy()
+
+    print('Numer of anchors:', gt_np.shape[0])
 
     for i, feature_name in enumerate(feature_names):
         plt.figure(figsize=(8, 6))
@@ -687,37 +813,46 @@ def log_feature_distribution(pred, gt, step, writer, feature_names):
 
 class GaussianSmall():
     def __init__(self,
-                 xyz=None,  # Dimension [N, 3]
-                 color=None,  # Dimension [N, 3]
-                 opacity=None,  # Dimension [N, 1]
-                 scaling=None,  # Dimension [N, 3]
-                 rotation=None,  # Dimension [N, 4] (Quaternion)
+                 features,  # Dimension [N, feat_dim]
+                 anchors,  # Dimension [N, 3]
+                 mlps
                  ):
-        self.N = xyz.shape[0] if xyz is not None else 0
+        self.N = anchors.shape[0]
+        self.anchors = anchors
+        print('FET', features.shape)
+        self._anchor_feat = features[:, 30:62] #.detach().clone().requires_grad_(True).cuda()
+        self._offset = features[:, :30].view(self.N, 10, 3) #.detach().clone().requires_grad_(True).cuda()
+        # self._offset.retain_grad()
+        self.n_offsets = 10
+        self.scaling = features[:, 63:] #.detach().clone().requires_grad_(True).cuda()
+        self._opacity = features[:, 62] #.detach().clone().requires_grad_(True).cuda()
+        self.rotation = torch.tensor([1, 0, 0, 0]).repeat(self.N, 1).float().cuda()
 
-        # Directly store Gaussian attributes
-        self.xyz = xyz  # Center positions of Gaussians [N, 3]
-        self.color = color  # Color of each Gaussian [N, 3]
-        self.opacity = opacity  # Opacity of each Gaussian [N, 1]
-        self.scaling = scaling  # Scaling factors [N, 3]
-        self.rotation = rotation  # Rotation represented as a quaternion [N, 4]
-        self.offset = None #torch.zeros_like(self.xyz)
+        print(f'rotation: {self.rotation.shape}')
 
-        # Activation functions for attributes
-        #self.scaling_activation = torch.exp
+        self.scaling_activation = torch.exp
+        self.scaling_inverse_activation = torch.log
+
         self.opacity_activation = torch.sigmoid
+
         self.rotation_activation = torch.nn.functional.normalize
 
+        self.mlp_opacity = mlps['mlp_opacity']
+        self.mlp_cov = mlps['mlp_cov']
+        self.mlp_color = mlps['mlp_color']
+
+        self.use_feat_bank = False
+        self.appearance_dim = 0
+        self.add_opacity_dist = False
+        self.add_color_dist = False
+        self.add_cov_dist = False
+
+        self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
 
     @property
     def get_scaling(self):
-        return self.scaling
-
-    @property
-    def get_color(self):
-        return self.color
-
+        return 1.0 * self.scaling_activation(self.scaling)
 
     @property
     def get_opacity_mlp(self):
@@ -736,30 +871,48 @@ class GaussianSmall():
         return self.rotation_activation(self.rotation)
 
     @property
-    def get_xyz(self):
-        return self.xyz + self.offset
-
+    def get_anchor(self):
+        return self.anchors.float()
 
     @property
     def get_opacity(self):
-        return self.opacity_activation(self.opacity)
+        return self.opacity_activation(self._opacity)
 
     def get_parameters(self):
         l = [
-            {'params': [self.offset], "name": "offset"},
-            {'params': [self.color], "name": "color"},
-            {'params': [self.opacity], "name": "opacity"},
+            {'params': [self._offset], "name": "offset"},
+            {'params': [self._anchor_feat],  "name": "anchor_feat"},
+            {'params': [self._opacity],  "name": "opacity"},
             {'params': [self.scaling], "name": "scaling"},
-            {'params': [self.rotation], "name": "rotation"},
         ]
+
         return l
 
     def training_setup(self, training_args):
+        self.opacity_accum = torch.zeros((self.anchors.shape[0], 1), device="cuda")
 
-        l = self.get_parameters()
+        # Accumulators for gradients and normalization
+        self.offset_gradient_accum = torch.zeros((self.anchors.shape[0] * self.n_offsets, 1), device="cuda")
+        self.offset_denom = torch.zeros((self.anchors.shape[0] * self.n_offsets, 1), device="cuda")
+        self.anchor_demon = torch.zeros((self.anchors.shape[0], 1), device="cuda")
+
+
+        """     l = [
+            {'params': [self._offset], 'lr': training_args.offset_lr_init, "name": "offset"},
+            {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+            {'params': [self.scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+        ]"""
+
+        l = [
+            {'params': [self._offset], 'lr': 0.01, "name": "offset"},
+            {'params': [self._anchor_feat], 'lr': 0.01, "name": "anchor_feat"},
+            {'params': [self._opacity], 'lr': 0.01, "name": "opacity"},
+            {'params': [self.scaling], 'lr': 0.01, "name": "scaling"},
+        ]
 
         # Optimizer
-        self.optimizer = torch.optim.Adam(l, lr=0.0005, eps=1e-15)
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         # Learning rate schedulers
 
@@ -768,43 +921,22 @@ class GaussianSmall():
                                                        lr_delay_mult=training_args.offset_lr_delay_mult,
                                                        max_steps=training_args.offset_lr_max_steps)
 
-    def check_gradients(self):
-        parameters = self.get_parameters()
-        for param_dict in parameters:
-            param_name = param_dict['name']
-            param_tensor = param_dict['params'][0]
-            if param_tensor.grad is None:
-                print(f"No gradient for parameter: {param_name}")
-            else:
-                grad_norm = param_tensor.grad.norm().item()
-                print(f"Gradient for parameter '{param_name}': Norm = {grad_norm}")
-        print('xyzgrad', self.xyz.grad)
+    def get_updated_features(self):
+        # Step 1: Flatten _offset back to the original shape (N, 30)
+        updated_offset = self._offset.view(self.N, 30)
 
-    def create_from_xyz(self, xyz):
-        # Initialize attributes from given xyz locations
-        self.N = xyz.shape[0]
-        print(self.N)
-        self.xyz = xyz.float().cuda().detach()  # Set xyz directly from input
-        self.offset = torch.zeros_like(self.xyz).float().cuda().requires_grad_(True)
-        self.color = torch.zeros((xyz.shape[0], 3)).float().cuda().requires_grad_(True)  # Initialize colors to zero
-        self.opacity = inverse_sigmoid(
-            0.1 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")).requires_grad_(True)  # Set initial opacity
-        average_squared_distances = compute_average_squared_distances(xyz)
-        #self.scaling = torch.log(torch.sqrt(torch.clamp_min(average_squared_distances, 1e-7)))[..., None].repeat(1, 3).requires_grad_(True)
-        self.scaling = torch.zeros((xyz.shape[0], 3)).float() + 0.05
-        self.scaling = self.scaling.cuda().requires_grad_(True)
-        print(self.scaling.shape, self.scaling, self.scaling.max(), self.scaling.min())
-        self.rotation = torch.zeros((xyz.shape[0], 4), device="cuda")  # Initialize rotation as identity quaternion
-        self.rotation[:, 0] = 1
-        self.rotation = self.rotation.requires_grad_(True)
+        # Step 2: Gather _anchor_feat (already in the correct shape)
+        updated_anchor_feat = self._anchor_feat
 
-    def from_sparse(self, features, xyz):
-        self.xyz = xyz
-        self.color = features[:, :3]
-        self.opacity = features[:, 3].unsqueeze(1)
-        self.scaling = features[:, 4:7]
-        self.rotation = features[:, 7:11]
-        self.offset = features[:, 11:]
+        # Step 3: Gather _opacity and scaling (both in the correct shapes)
+        updated_opacity = self._opacity.unsqueeze(1)  # Make sure it has the shape [N, 1]
+        updated_scaling = self.scaling
+
+        # Step 4: Concatenate all parts to match the input feature vector's structure
+        updated_features = torch.cat((updated_offset, updated_anchor_feat, updated_opacity, updated_scaling), dim=1)
+
+        return updated_features
+
 
 
     def update_learning_rate(self, iteration):
@@ -814,44 +946,7 @@ class GaussianSmall():
                 lr = self.offset_scheduler_args(iteration)
                 param_group['lr'] = lr
 
-    def export_to_ply(self, filename):
-        """
-        Exports the GaussianSmall object as a PLY file with color information.
-        Args:
-            filename (str): Path to the output PLY file.
-        """
-        if self.xyz is None or self.color is None:
-            raise ValueError("xyz and color attributes must be initialized before exporting to PLY.")
 
-        # Convert tensors to numpy arrays
-        vertices = (self.xyz + self.offset).cpu().detach().numpy()
-        colors = self.color.cpu().detach().numpy()
-
-        # Ensure colors are in the range [0, 255]
-        colors = np.clip(colors * 255, 0, 255).astype(np.uint8)
-
-        # Prepare PLY header
-        num_vertices = vertices.shape[0]
-        ply_header = f"""ply
-format ascii 1.0
-element vertex {num_vertices}
-property float x
-property float y
-property float z
-property uchar red
-property uchar green
-property uchar blue
-end_header
-"""
-        # Combine vertex positions and colors
-        ply_data = np.hstack((vertices, colors))
-
-        # Write PLY file
-        with open(filename, 'w') as f:
-            f.write(ply_header)
-            np.savetxt(f, ply_data, fmt='%f %f %f %d %d %d')
-
-        print(f"PLY file saved to {filename}")
 
 ####################################################
 
@@ -867,7 +962,6 @@ from IPython.display import display
 import torch.multiprocessing as mp
 import gc
 import pickle
-from torch.optim.lr_scheduler import StepLR
 
 
 def image_gradients(image):
@@ -880,15 +974,38 @@ def gradient_loss(pred, gt):
     gt_dx, gt_dy = image_gradients(gt)
     return torch.mean(torch.abs(pred_dx - gt_dx) + torch.abs(pred_dy - gt_dy))
 
+def get_cuda_tensors():
+    return {id(obj): obj for obj in gc.get_objects() if isinstance(obj, torch.Tensor) and obj.is_cuda}
 
-def train(train_files=None, eval_files=None, dataset_config=None, loss_config=None,  model_path='weights_005_sep.pth',
+
+def clear_cuda_tensors(ids):
+    # Find all CUDA tensors
+    cuda_tensors = [obj for obj in gc.get_objects() if isinstance(obj, torch.Tensor) and obj.is_cuda]
+
+    print(f"Found {len(cuda_tensors)} CUDA tensors.")
+
+    # Move tensors to CPU and delete
+    for tensor in cuda_tensors:
+        tensor.cpu()  # Move tensor to CPU to free GPU memory
+        del tensor
+
+    # Trigger garbage collection and clear GPU cache
+    torch.cuda.empty_cache()
+    gc.collect()
+    print("Cleared CUDA tensors.")
+
+
+from torch.utils.viz._cycles import warn_tensor_cycles
+
+
+def train(train_files=None, eval_files=None, dataset_config=None, mlps=None, loss_config=None,  model_path='weights_005_sep.pth',
           save_path='weights_005_add.pth',
           exp_name="CompletionNet_0.05_sep", num_epochs=200, lr=0.1, visualize=False, writer_name=None):
     mp.set_start_method('spawn')
 
     print('Experiment:', exp_name)
     # Load Model
-    net = CompletionNetSmaller()
+    net = CompletionNetSmaller(feat_size=70)
 
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Total number of learnable parameters: {total_params}")
@@ -964,6 +1081,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
 
     num_samples = len(dataset)
 
+
     for epoch in range(start_epoch, num_epochs):
         diff_v = True
         print('Epoch {}/{}'.format(epoch, num_epochs))
@@ -977,6 +1095,8 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
 
         iou_computed = False
 
+        start_epoch_time = time.time()
+        start_sample_load_time = time.time()
 
         if epoch % store_frequency == 0:
             torch.save(
@@ -992,7 +1112,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
         for i, batch in enumerate(dataloader):
             print('Sample {}/{}'.format(i, num_samples))
 
-
+            #incomplete_tensor, ground_truth_tensor = batch['incomplete'], batch['ground_truth']
             incomplete_features, incomplete_coords, ground_truth_features, ground_truth_coords, scenes_info = batch
 
             # Create sparse tensors for incomplete and ground truth data
@@ -1015,12 +1135,16 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                 string_id="target",
             )
 
+            print(scenes_info[0]['incomplete_path'])
+
             for iteration in range(epoch*n_it, (epoch+1)*n_it):
                 loss = 0
-                print(incomplete_tensor.device)
-                print(scenes_info[0]['incomplete_path'])
 
                 out_cls, targets, _ = net(incomplete_tensor, target_key)
+
+
+                # Identify new tensors
+                # Identify new tensors
 
                 if loss_pres_flag:
 
@@ -1038,7 +1162,12 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                     epoch_loss_pres += pres_loss.detach().cpu().item()
                     loss += 2 * pres_loss
 
-                    del pres_loss, num_layers, curr_loss
+                    del curr_loss, pres_loss, num_layers
+                    torch.cuda.empty_cache()
+
+                    print('after loss')
+                    print(
+                        f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
 
                     if visualize and epoch % vis_frequency == 0:
                         print('Visualize Train\n\n\n')
@@ -1078,15 +1207,11 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         o3d.visualization.draw_geometries(ll)
                         ll.clear()
 
-                print('before feat')
-                print(
-                    f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
-
                 if loss_feat_flag:
 
                     print('Compute Feature Loss')
 
-                    keep = targets[-1] #(out_cls[-1].F[:, :1] > 0).squeeze()
+                    keep = (out_cls[-1].F[:, :1] > 0).squeeze()
                     out_cls_pruned = pruning(out_cls[-1], keep)
 
                     # Find matching anchors
@@ -1101,50 +1226,49 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         ground_truth_features = ground_truth_tensor.F[B_indices, 1:]
 
 
-                        #mask = (torch.sum(torch.abs(ground_truth_features), dim=0) != 0).float()
-                        #mask = mask.unsqueeze(0).expand(ground_truth_features.shape)
+                        mask = (torch.sum(torch.abs(ground_truth_features), dim=0) != 0).float()
+                        mask = mask.unsqueeze(0).expand(ground_truth_features.shape)
 
                         mse_loss_per_element = (mapped_features - ground_truth_features) ** 2
 
-                        masked_loss = mse_loss_per_element #* mask
+                        masked_loss = mse_loss_per_element * mask
 
-                        feature_loss = masked_loss.mean() #/ mask.sum()
+                        feature_loss = masked_loss.sum() / mask.sum()
 
                         loss += feature_loss
 
                         print('Feauture_loss:', feature_loss)
 
-                        epoch_loss_feat += feature_loss.cuda().detach().item()
+                        epoch_loss_feat += feature_loss.item()
 
-                    del keep, out_cls_pruned, A, B,mse_loss_per_element, masked_loss, feature_loss, A_indices, B_indices
-                    del mapped_features, ground_truth_features
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    print('after feat')
-                    print(
-                        f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
+                        feature_names = [f'f_offset_{i}' for i in range(30)] + \
+                                        [f'f_anchor_feat_{i}' for i in range(32)] + \
+                                        ['opacity'] + \
+                                        [f'scale_{i}' for i in range(6)]
+
+
+
+                        del mse_loss_per_element, masked_loss, feature_loss, ground_truth_features, mask, A_indices, B_indices
+                        torch.cuda.empty_cache()
+
+
+
 
                 if (loss_feat_flag and epoch % logging_frequency and iteration==epoch*n_it) or loss_render_flag:
 
-
-                    #TODO change this for multi scenes
                     train_cameras = scenes_info[0]['train_cameras']
                     # Pick a random Camera
                     viewpoint_stack = None
                     if not viewpoint_stack:
                         viewpoint_stack = train_cameras.copy()
 
-                    keep = targets[-1]#(out_cls[-1].F[:, :1] > 0).squeeze()
+                    keep = (out_cls[-1].F[:, :1] > 0).squeeze()
                     out_cls_pruned = pruning(out_cls[-1], keep)
 
                     features = out_cls_pruned.F[:, 1:]
                     anchors = out_cls_pruned.C[:, 1:].float() * dataset_config['voxel_size']
 
-                    gaussians = GaussianSmall()
-                    gaussians.from_sparse(features, anchors.detach())
-
-                    print('feature', features.shape, anchors.shape)
-
+                    gaussians = GaussianSmall(features, anchors.detach(), mlps)
 
                     for mini in range(mini_size):
                         bg_color = [0, 0, 0]
@@ -1157,12 +1281,12 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         #    viewpoint_stack = train_cameras.copy()
                         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-                        voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background, no_scaffold=True)
+                        voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
 
                         retain_grad = True  # (iteration < opt.update_until and iteration >= 0)
                         render_pkg = render(viewpoint_cam, gaussians, pipe, background, is_training=True,
                                             visible_mask=voxel_visible_mask,
-                                            retain_grad=retain_grad, no_scaffold=True)
+                                            retain_grad=retain_grad)
 
                         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = \
                             render_pkg[
@@ -1178,7 +1302,6 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                             writer.add_image('LOSS/pred', image.detach().cpu(), iteration)
                             writer.add_image('LOSS/gt', gt_image.detach().cpu(), iteration)
 
-                        print('images', image.shape, gt_image.shape)
                         Ll1 = l1_loss(image, gt_image)
 
                         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -1189,10 +1312,9 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         torch.cuda.empty_cache()
 
                         scaling_reg = scaling.prod(dim=1).mean()
-                        print(f'ssim:  {ssim_loss}, psnr: {psnr_v}, l1: {Ll1}, scaling_reg: {scaling_reg}')
-                        loss_render = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss #+ 0.01 * scaling_reg
+                        loss_render = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg
                         print('Render loss', loss_render.item())
-                        epoch_loss_render += loss_render.detach().cpu().item()
+                        epoch_loss_render += loss_render.item()
 
                         #print('Render loss', loss_render.item())
                         if loss_render_flag:
@@ -1203,42 +1325,34 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         epoch_psnr += psnr_v.detach().cpu().item() /mini_size
                         epoch_ssim += ssim_loss.detach().cpu().item() /mini_size
 
-                        epoch_loss += loss.detach().cpu().item() /mini_size
+                        epoch_loss += loss.item() /mini_size
 
                         del loss_render, psnr_v, ssim_loss, scaling_reg
                         torch.cuda.empty_cache()
 
-                    del features, keep, gaussians, anchors
-                    torch.cuda.empty_cache()
 
-
-                print('before loss backward')
-                print(
-                    f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
-
-                # Backward pass and optimize
                 loss.backward()
 
                 net_optimizer.step()
                 net_optimizer.zero_grad(set_to_none=True)
+
                 gc.collect()  # Forces Python's garbage collector to free memory
 
-                print('after loss backward')
-                print(
-                    f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
 
                 for p in net.parameters():
                     if hasattr(p, 'grad') and p.grad is not None:
-                        print(delete)
-                        p.grad = None
+                        print(p, 'delete')
                         del p.grad
 
                 print('after delete')
                 print(
                     f"{(torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100:.2f}%")
 
-                del loss, incomplete_tensor, ground_truth_tensor, out_cls, targets, cm, target_key
+                del loss
+                del incomplete_tensor, ground_truth_tensor, out_cls, targets, batch, cm, target_key
                 torch.cuda.empty_cache()
+
+                gc.collect()  # Trigger garbage collectioncollectpartial
 
 
         writer.add_scalar('Loss/loss', epoch_loss/ num_samples, epoch)
@@ -1252,7 +1366,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
         writer.add_scalar('PresLoss/train_epoch', epoch_loss_pres /num_samples , epoch)
 
         current_lr = net_optimizer.param_groups[0]['lr']
-        writer.add_scalar('LR', current_lr , epoch)
+        writer.add_scalar('LR', current_lr, epoch)
 
         scheduler.step()
 
@@ -1263,6 +1377,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
         pred_var = 0
         epoch_psnr = 0
         epoch_ssim = 0
+        eval_iou_loss = 0
 
         if epoch % eval_frequency == 0:
             print('EVAl\n:')
@@ -1276,6 +1391,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
             with torch.no_grad():
                 for i, batch in enumerate(eval_dataloader):
 
+                    #incomplete_tensor, ground_truth_tensor = batch['incomplete'], batch['ground_truth']
                     incomplete_tensor, ground_truth_tensor, scenes_info = batch
 
                     cm = incomplete_tensor.coordinate_manager
@@ -1283,7 +1399,6 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         ground_truth_tensor.C,
                         string_id="target",
                     )
-                    print(scenes_info[0]['incomplete_path'])
                     out_cls, targets, _ = net(incomplete_tensor, target_key)
 
                     if pres_eval:
@@ -1313,7 +1428,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                             out_cls_b = pruning(out_cls[-1], keep)
 
                             print(out_cls_b.C.shape)
-                            keep = targets[-1] #(out_cls_b.F[:, :1] > 0).squeeze()
+                            keep = (out_cls_b.F[:, :1] > 0).squeeze()
                             out_cls_pruned = pruning(out_cls_b, keep)
 
                             keep = (ground_truth_tensor.C[:, :1] == b).squeeze()
@@ -1335,7 +1450,7 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                             print('IOU', b, iou)
 
                     if feat_eval:
-                        keep = targets[-1] #(out_cls[-1].F[:, :1] > 0).squeeze()
+                        keep = (out_cls[-1].F[:, :1] > 0).squeeze()
                         out_cls_pruned = pruning(out_cls[-1], keep)
 
                         # Find matching anchors
@@ -1358,7 +1473,6 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
 
                             feature_loss = masked_loss.sum() / mask.sum()
 
-
                             eval_feat_loss += feature_loss.item()
 
                     if render_eval:
@@ -1368,28 +1482,27 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                         if not viewpoint_stack:
                             viewpoint_stack = train_cameras.copy()
 
-                        keep = targets[-1]#(out_cls[-1].F[:, :1] > 0).squeeze()
+                        keep = (out_cls[-1].F[:, :1] > 0).squeeze()
                         out_cls_pruned = pruning(out_cls[-1], keep)
 
                         features = out_cls_pruned.F[:, 1:]
                         anchors = out_cls_pruned.C[:, 1:].float() * dataset_config['voxel_size']
 
-                        gaussians = GaussianSmall()
-                        gaussians.from_sparse(features, anchors.detach())
+                        gaussians = GaussianSmall(features, anchors.detach(), mlps)
 
-                        num_imgs = len(train_cameras)
-                        for mini in range(num_imgs):
+                        mini_size = 16
+                        for mini in range(mini_size):
                             bg_color = [0, 0, 0]
                             background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
                             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-                            voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background, no_scaffold=True)
+                            voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
 
                             retain_grad = True  # (iteration < opt.update_until and iteration >= 0)
                             render_pkg = render(viewpoint_cam, gaussians, pipe, background, is_training=True,
                                                 visible_mask=voxel_visible_mask,
-                                                retain_grad=retain_grad, no_scaffold=True)
+                                                retain_grad=retain_grad)
 
                             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = \
                                 render_pkg[
@@ -1403,8 +1516,8 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                             # writer.add_image('LOSS/pred', image, epoch)
                             # writer.add_image('LOSS/gt', gt_image, epoch)
                             if mini == 0:
-                                writer.add_image(f'EVAL/pred_{i}/{mini}', image.detach().cpu(), epoch)
-                                writer.add_image(f'EVAL/gt_{i}/{mini}', gt_image.detach().cpu(), epoch)
+                                writer.add_image(f'EVAL/pred_{i}', image.detach().cpu(), epoch)
+                                writer.add_image(f'EVAL/gt_{i}', gt_image.detach().cpu(), epoch)
 
                             Ll1 = l1_loss(image, gt_image)
 
@@ -1420,11 +1533,11 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                             epoch_loss_render += loss_render.item()
 
                             # print('Render loss', loss_render.item())
-                            eval_render_loss += loss_render / num_imgs
+                            eval_render_loss += loss_render / mini_size
 
-                            eval_psnr_loss += psnr_v.detach().cpu().item() / num_imgs
+                            eval_psnr_loss += psnr_v.detach().cpu().item() / mini_size
 
-                            eval_ssim_loss += ssim_loss.detach().cpu().item() / num_imgs
+                            eval_ssim_loss += ssim_loss.detach().cpu().item() / mini_size
 
                             del loss_render, psnr_v, ssim_loss, scaling_reg
                             torch.cuda.empty_cache()
@@ -1442,8 +1555,9 @@ def train(train_files=None, eval_files=None, dataset_config=None, loss_config=No
                 torch.cuda.empty_cache()
 
 
-    writer.close()
 
+
+    writer.close()
 
 def find_matching_indices(tensor1, tensor2):
     # Convert tensor1 to tuple format and store indices in a dictionary
@@ -1461,239 +1575,11 @@ def find_matching_indices(tensor1, tensor2):
 
     return torch.tensor(indices1), torch.tensor(indices2)
 
-from io import BytesIO
-from utils.graphics_utils import fov2focal
-import json
 
-
-def camera_to_JSON(id, camera):
-    Rt = np.zeros((4, 4))
-    Rt[:3, :3] = camera.R.transpose()
-    Rt[:3, 3] = camera.T
-    Rt[3, 3] = 1.0
-
-    W2C = np.linalg.inv(Rt)
-    pos = W2C[:3, 3]
-    rot = W2C[:3, :3]
-    serializable_array_2d = [x.tolist() for x in rot]
-    camera_entry = {
-        'id' : id,
-        'img_name' : camera.image_name,
-        'width' : camera.image_width,
-        'height' : camera.image_height,
-        'position': pos.tolist(),
-        'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FoVy, camera.image_height),
-        'fx' : fov2focal(camera.FoVx, camera.image_width)
-    }
-    return camera_entry
-
-def process_ply_to_splat(ply_file_path):
-    plydata = PlyData.read(ply_file_path)
-    vert = plydata["vertex"]
-    sorted_indices = np.argsort(
-        -np.exp(vert["scale_0"] + vert["scale_1"] + vert["scale_2"])
-        / (1 + np.exp(-vert["opacity"]))
-    )
-    buffer = BytesIO()
-    for idx in sorted_indices:
-        v = plydata["vertex"][idx]
-        position = np.array([v["x"], v["y"], v["z"]], dtype=np.float32)
-        scales = np.exp(
-            np.array(
-                [v["scale_0"], v["scale_1"], v["scale_2"]],
-                dtype=np.float32,
-            )
-        )
-        rot = np.array(
-            [v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]],
-            dtype=np.float32,
-        )
-        SH_C0 = 0.28209479177387814
-        color = np.array(
-            [
-                0.5 + SH_C0 * v["f_dc_0"],
-                0.5 + SH_C0 * v["f_dc_1"],
-                0.5 + SH_C0 * v["f_dc_2"],
-                1 / (1 + np.exp(-v["opacity"])),
-            ]
-        )
-
-
-        buffer.write(position.tobytes())
-        buffer.write(scales.tobytes())
-        buffer.write((color * 255).clip(0, 255).astype(np.uint8).tobytes())
-        buffer.write(
-            ((rot / np.linalg.norm(rot)) * 128 + 128)
-            .clip(0, 255)
-            .astype(np.uint8)
-            .tobytes()
-        )
-
-    return buffer.getvalue()
-
-from scene.cameras import Camera
-def generate_rotated_cameras(camera, num_cameras=100):
-    """
-    Generate `num_cameras` rotated instances of a given Camera object by rotating around its Z-axis.
-
-    Args:
-        camera (Camera): An instance of the Camera class to be rotated.
-        num_cameras (int): Number of cameras to generate (default: 100).
-
-    Returns:
-        list[Camera]: A list of rotated Camera objects.
-    """
-    # Full rotation in radians
-    full_rotation = 2 * np.pi
-
-    # Angle step for each rotation
-    angle_step = full_rotation / num_cameras
-
-    # Extract the rotation matrix (R) and translation vector (T) from the input camera
-    original_R = camera.R  # Convert to numpy for matrix operations
-    original_T = camera.T  # Translation remains constant
-
-    C = -original_R.T @ original_T
-
-
-    # List to store new Camera objects
-    rotated_cameras = []
-
-    for i in range(num_cameras):
-        # Compute the rotation angle
-        angle = i * angle_step
-
-        print('og', original_R, angle)
-
-        R_z = np.array([
-            [np.cos(angle), -np.sin(angle), 0],
-            [np.sin(angle), np.cos(angle), 0],
-            [0, 0, 1]
-        ], dtype=np.float32)
-
-        # Apply the Z-axis rotation to the original rotation matrix (R)
-        # Choose pre-multiplication or post-multiplication based on your coordinate system
-        #new_R = R_z @ original_R  # Rotate around world Z-axis
-        new_R = original_R @ R_z  # Rotate around camera's local Z-axis
-
-        # Recompute T to keep the camera center C the same
-        new_T = -new_R @ C
-
-        print(new_R)
-
-        # Create a new Camera object with the updated R and the same T
-        new_camera = Camera(
-            colmap_id=camera.colmap_id,
-            R=new_R,
-            T=new_T,
-            FoVx=camera.FoVx,
-            FoVy=camera.FoVy,
-            image=camera.original_image,  # Reuse the same image
-            gt_alpha_mask=None,  # Reuse existing alpha mask if needed
-            image_name=camera.image_name,
-            uid=f"{camera.uid}_rot_{i}",  # Give a unique ID to each rotated camera
-            data_device=camera.data_device
-        )
-
-        rotated_cameras.append(new_camera)
-
-    return rotated_cameras
-
-from scipy.spatial.transform import Rotation as R, Slerp
-
-
-def interpolate_cameras(cameras):
-    """
-    Given a list of Camera objects, interpolate between each pair of adjacent cameras
-    and insert the interpolated camera between them.
-
-    Args:
-        cameras (list of Camera): The original list of Camera objects.
-
-    Returns:
-        list of Camera: The new list of Camera objects, including the original cameras
-        and the interpolated cameras.
-    """
-    interpolated_cameras = []
-
-    for i in range(len(cameras) - 1):
-        cam1 = cameras[i]
-        cam2 = cameras[i + 1]
-
-        # Interpolate between cam1 and cam2
-        cam_interp = interpolate_camera(cam1, cam2, alpha=0.5)
-
-        # Append cam1 and cam_interp to the new list
-        interpolated_cameras.append(cam1)
-        interpolated_cameras.append(cam_interp)
-
-    # Append the last original camera
-    interpolated_cameras.append(cameras[-1])
-
-    return interpolated_cameras
-
-def interpolate_camera(cam1, cam2, alpha):
-    """
-    Interpolate between two Camera objects.
-
-    Args:
-        cam1 (Camera): The first camera.
-        cam2 (Camera): The second camera.
-        alpha (float): Interpolation parameter between 0 and 1.
-
-    Returns:
-        Camera: The interpolated camera.
-    """
-    # Interpolate translations
-    T1 = cam1.T
-    T2 = cam2.T
-    T_interp = (1 - alpha) * T1 + alpha * T2
-
-    # Convert rotation matrices to Rotation objects
-    rot1 = R.from_matrix(cam1.R)
-    rot2 = R.from_matrix(cam2.R)
-
-    # Set up SLERP interpolation
-    times = [0, 1]
-    rots = R.from_matrix([cam1.R, cam2.R])
-
-    slerp = Slerp(times, rots)
-
-    # Interpolate at the desired time
-    rot_interp = slerp([alpha])[0]
-
-    # Convert back to rotation matrix
-    R_interp = rot_interp.as_matrix()
-
-    # Interpolate other parameters if needed
-    FoVx_interp = (1 - alpha) * cam1.FoVx + alpha * cam2.FoVx
-    FoVy_interp = (1 - alpha) * cam1.FoVy + alpha * cam2.FoVy
-
-    # Generate a new UID for the interpolated camera
-    new_uid = f"{cam1.uid}_interp_{cam2.uid}"
-
-    # Create a new Camera object with interpolated parameters
-    new_camera = Camera(
-        colmap_id=None,
-        R=R_interp,
-        T=T_interp,
-        FoVx=FoVx_interp,
-        FoVy=FoVy_interp,
-        image=cam1.original_image,             # Set to None or handle as needed
-        gt_alpha_mask=None,     # Set to None or handle as needed
-        image_name=cam1.image_name,        # Set to None or handle as needed
-        uid=new_uid,
-        data_device=cam1.data_device  # Assume same device as cam1
-    )
-
-    return new_camera
-
-
-def evaluate(eval_files=None, dataset_config=None,  model_path='weights_005_sep.pth', exp_name='', eval_iou=True, eval_img=True, render_video=False, split='test', visualize=False, writer_name=None):
+def evaluate(eval_files=None, dataset_config=None,mlps=None,  model_path='weights_005_sep.pth', exp_name='', eval_iou=True, eval_img=True, render_video=False, split='test', visualize=False, writer_name=None):
     print(exp_name)
     # Load Model
-    net = CompletionNetSmaller()
+    net = CompletionNetSmaller(feat_size=70)
 
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
 
@@ -1824,14 +1710,12 @@ def evaluate(eval_files=None, dataset_config=None,  model_path='weights_005_sep.
                 features = out_cls_pruned.F[:, 1:]
                 anchors = out_cls_pruned.C[:, 1:].float() * dataset_config['voxel_size']
 
-                gaussians = GaussianSmall()
-                gaussians.from_sparse(features, anchors.detach())
+                gaussians = GaussianSmall(features, anchors.detach(), mlps)
 
                 incfeatures = incomplete_tensor.F[:, 1:]
                 incanchors = incomplete_tensor.C[:, 1:].float() * dataset_config['voxel_size']
 
-                inc_gaussians = GaussianSmall()
-                inc_gaussians.from_sparse(incfeatures, incanchors.detach())
+                inc_gaussians = GaussianSmall(incfeatures, incanchors.detach(), mlps)
 
                 if render_video:
                     video_path = os.path.join('videos', exp_name, path, 'predicted')
@@ -1921,14 +1805,11 @@ def evaluate(eval_files=None, dataset_config=None,  model_path='weights_005_sep.
                 gtfeatures = ground_truth_tensor.F[:, 1:]
                 gtanchors = ground_truth_tensor.C[:, 1:].float() * dataset_config['voxel_size']
 
-                gt_gaussians = GaussianSmall()
-                gt_gaussians.from_sparse(gtfeatures, gtanchors.detach())
-
+                gt_gaussians = GaussianSmall(gtfeatures, gtanchors.detach(), mlps)
 
                 eval_psnr = 0
                 eval_ssim = 0
                 print(path)
-                json_cams = []
 
                 for view in range(num_imgs):
                     bg_color = [0, 0, 0]
@@ -1936,7 +1817,6 @@ def evaluate(eval_files=None, dataset_config=None,  model_path='weights_005_sep.
 
                     viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-                    json_cams.append(camera_to_JSON(view, viewpoint_cam))
                     voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background,
                                                          no_scaffold=True)
 
@@ -2016,56 +1896,11 @@ def evaluate(eval_files=None, dataset_config=None,  model_path='weights_005_sep.
 
 
 
-from plyfile import PlyData, PlyElement
-import numpy as np
-def convert_gaussian_to_ply(gaussian_small, output_ply_path):
-    # Prepare the data for the PLY file
-    vertex_data = []
-    for i in range(len(gaussian_small.xyz)):
-        position = gaussian_small.xyz[i] + gaussian_small.offset[i]
-        scaling = gaussian_small.scaling[i]
-        rotation = gaussian_small.rotation[i]
-        color = gaussian_small.color[i]
-        opacity = gaussian_small.opacity[i, 0]  # Assuming opacity is a 2D array with shape [N, 1]
-
-        # Append the data to the list in the format expected by the PLY file
-        vertex_data.append(
-            (
-                position[0], position[1], position[2],  # x, y, z
-                scaling[0], scaling[1], scaling[2],  # scale_0, scale_1, scale_2
-                rotation[0], rotation[1], rotation[2], rotation[3],  # rot_0, rot_1, rot_2, rot_3
-                color[0], color[1], color[2],  # f_dc_0, f_dc_1, f_dc_2
-                opacity,  # opacity
-            )
-        )
-
-    # Define the data type for the PLY file
-    ply_dtype = [
-        ("x", "f4"), ("y", "f4"), ("z", "f4"),  # Position
-        ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),  # Scaling factors
-        ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),  # Rotation (quaternion)
-        ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),  # SH coefficients for color
-        ("opacity", "f4"),  # Opacity
-    ]
-
-    # Convert the list of data to a NumPy structured array
-    vertex_array = np.array(vertex_data, dtype=ply_dtype)
-
-    # Create the PLY element
-    ply_element = PlyElement.describe(vertex_array, "vertex")
-
-    print(len(vertex_data))
-    # Write the PLY file
-    PlyData([ply_element]).write(output_ply_path)
-
-    print(f"PLY file successfully written to {output_ply_path}")
-
-
 
 def load_files(file_path):
+    """Load file paths from a text file."""
     with open(file_path, 'r') as file:
         return [line.strip() for line in file]
-
 
 def main():
     # Argument parsing
@@ -2074,27 +1909,35 @@ def main():
     parser.add_argument("--evaluate", action="store_true", help="Run the evaluation mode instead of training.")
     args = parser.parse_args()
 
-    # Load config
+    # Load configuration
     with open(args.config, 'r') as config_file:
         config = json.load(config_file)
 
-    # Load file names
+    # Load train and test file names
     train_files = load_files(config['file_names']['train'])
     test_files = load_files(config['file_names']['val'])
 
-    print('Train Files:', len(train_files), train_files)
-    print('Test Files:', test_files)
+    print(f"Train Files: {len(train_files)} loaded.")
+    print(f"Test Files: {len(test_files)} loaded.")
 
-    # Dataset configuration
+    # Load dataset configuration
     dataset_config = config['dataset_config']
 
-    # Check mode from argument or config
+    # Load MLPs
+    mlps_path = os.path.join('mlps', dataset_config['mlps_name'])
+    mlps = {
+        'mlp_opacity': torch.jit.load(os.path.join(mlps_path, 'opacity_mlp.pt')).cuda(),
+        'mlp_cov': torch.jit.load(os.path.join(mlps_path, 'cov_mlp.pt')).cuda(),
+        'mlp_color': torch.jit.load(os.path.join(mlps_path, 'color_mlp.pt')).cuda()
+    }
+
     if args.evaluate:
         eval_config = config['evaluation']
-        print('Starting Evaluation...')
+        print("Starting Evaluation...")
         evaluate(
             eval_files=test_files,
             dataset_config=dataset_config,
+            mlps=mlps,
             model_path=eval_config['model_path'],
             exp_name=eval_config['exp_name'],
             eval_iou=eval_config['eval_iou'],
@@ -2102,15 +1945,16 @@ def main():
             render_video=eval_config['render_video'],
             visualize=eval_config['visualize'],
             split=eval_config['split'],
-            writer_name = config['logging']['writer_name']
+            writer_name=config['logging']['writer_name']
         )
     else:
         train_config = config['training']
-        print('Starting Training...')
+        print("Starting Training...")
         train(
             train_files=train_files,
             eval_files=test_files,
             dataset_config=dataset_config,
+            mlps=mlps,
             loss_config=train_config['loss'],
             model_path=train_config['model_path'],
             save_path=train_config['save_path'],
@@ -2120,8 +1964,6 @@ def main():
             visualize=train_config['visualize'],
             writer_name=config['logging']['writer_name']
         )
-
-
 
 if __name__ == "__main__":
     main()
